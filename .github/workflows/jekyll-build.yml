@@ -1,23 +1,23 @@
-name: Jekyll build
+name: Build and deploy homepage
 
 on:
-  # Run after bad-pr check
-  workflow_run:
-    workflows: ["Cleanup bad PR"]
-    branches: [main]
-    types:
-      - completed
-      
+  push:
+    branches: [master]
+  workflow_dispatch:
+
 permissions:
   contents: read
+  pages: read
 
 concurrency:
-  group: jekyll-build-${{ github.ref }}
+  group: homepage-${{ github.ref }}
   cancel-in-progress: true
 
 jobs:
   build:
     runs-on: ubuntu-latest
+    outputs:
+      pages_enabled: ${{ steps.pages.outputs.enabled }}
     steps:
       - name: Check out repository
         uses: actions/checkout@v4
@@ -29,6 +29,124 @@ jobs:
           bundler-cache: true
 
       - name: Build site
-        run: bundle exec jekyll build --strict_front_matter
+        run: bundle exec jekyll build --strict_front_matter --trace
         env:
           JEKYLL_ENV: production
+
+      - name: Verify single-page content and internal links
+        run: |
+          python3 - <<'PY'
+          import json
+          from html.parser import HTMLParser
+          from pathlib import Path
+          from urllib.parse import unquote, urlsplit
+
+          root = Path('_site')
+          pages = sorted(str(p.relative_to(root)) for p in root.rglob('*.html'))
+          assert pages == ['index.html'], f'Unexpected HTML pages: {pages}'
+          source = Path('_pages/about.md').read_text(encoding='utf-8')
+          assert '## Publications' in source
+          html = (root / 'index.html').read_text(encoding='utf-8')
+
+          class Page(HTMLParser):
+              def __init__(self):
+                  super().__init__()
+                  self.text = []
+                  self.ids = set()
+                  self.links = []
+              def handle_data(self, data):
+                  self.text.append(data)
+              def handle_starttag(self, tag, attrs):
+                  attrs = dict(attrs)
+                  if 'id' in attrs:
+                      self.ids.add(attrs['id'])
+                  for key in ('href', 'src'):
+                      if attrs.get(key):
+                          self.links.append(attrs[key])
+
+          page = Page()
+          page.feed(html)
+          text = ' '.join(' '.join(page.text).split())
+          titles = [
+              'SynLogic: Synthesizing Verifiable Reasoning Data at Scale for Learning Logical Reasoning and Beyond',
+              'On the Perception Bottleneck of VLMs for Chart Understanding',
+              'On the Universal Truthfulness Hyperplane Inside LLMs',
+              'In-Context Sharpness as Alerts: An Inner Representation Perspective for Hallucination Mitigation',
+              'C-Eval: A Multi-Level Multi-Discipline Chinese Evaluation Suite for Foundation Models',
+              'Composing Parameter-Efficient Modules with Arithmetic Operations',
+          ]
+          for title in titles:
+              assert title in source, f'Publication missing from About source: {title}'
+              assert title in text, f'Publication missing from rendered homepage: {title}'
+          for fact in ('Junteng Liu', 'HKUST NLP Group', 'Junxian He', 'Shanghai Jiao Tong University',
+                       'MINIMAX', 'Tencent WXG', 'Shanghai AI Lab', 'Zifei Shan', 'Yu Cheng',
+                       'Zhiyuan Honor Scholarship', 'jliugi@connect.ust.hk', 'Vicent0205', 'junteng88716710'):
+              assert fact in text, f'Missing fact: {fact}'
+          for placeholder in ('Your Name', 'Your Sidebar Name', 'Short biography for the left-hand sidebar',
+                              'Red Brick University', 'none@example.org', 'PS_CX0AAAAAJ', 'yourorcidurl',
+                              'john+snow', 'Paper Title Number'):
+              assert placeholder not in html, f'Template placeholder remains: {placeholder}'
+          assert 'profile.png' not in html, 'No personal portrait was provided'
+
+          def check_local(url):
+              parsed = urlsplit(url)
+              if parsed.scheme and parsed.scheme not in ('http', 'https'):
+                  return
+              if parsed.netloc and parsed.netloc != 'getinsh.github.io':
+                  return
+              path = unquote(parsed.path)
+              if path:
+                  assert path.startswith('/LJT-Homepage/'), f'Incorrect project-site path: {url}'
+                  target = root / path[len('/LJT-Homepage/'):]
+                  if path.endswith('/'):
+                      target = target / 'index.html'
+              else:
+                  target = root / 'index.html'
+              assert target.is_file(), f'Missing local target: {url}'
+              if parsed.fragment and target == root / 'index.html':
+                  assert unquote(parsed.fragment) in page.ids, f'Missing section: {url}'
+
+          for url in page.links:
+              check_local(url)
+          manifest = json.loads((root / 'images/manifest.json').read_text(encoding='utf-8'))
+          check_local(manifest['start_url'])
+          for icon in manifest['icons']:
+              check_local(icon['src'])
+          print('Verified: one HTML page, six publications on About, memory-sourced profile, no template placeholders, valid internal links and assets.')
+          PY
+
+      - name: Upload Pages artifact
+        uses: actions/upload-pages-artifact@v3
+        with:
+          path: _site
+
+      - name: Check whether GitHub Pages is enabled for Actions
+        id: pages
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          if build_type=$(gh api "repos/$GH_REPO/pages" --jq '.build_type' 2> "$RUNNER_TEMP/pages-status.log") && [ "$build_type" = "workflow" ]; then
+            echo "enabled=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "enabled=false" >> "$GITHUB_OUTPUT"
+            echo "::notice::Site built and verified. Deployment requires Settings > Pages > Source: GitHub Actions."
+            echo "Site built and verified. Deployment was skipped because GitHub Pages is not configured for GitHub Actions." >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+  deploy:
+    if: needs.build.outputs.pages_enabled == 'true'
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      pages: write
+      id-token: write
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - name: Configure GitHub Pages
+        uses: actions/configure-pages@v5
+      - name: Deploy GitHub Pages
+        id: deployment
+        uses: actions/deploy-pages@v4
